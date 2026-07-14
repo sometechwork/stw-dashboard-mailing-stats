@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class STW_Dashboard_Mailing_Stats {
 	const OPTION_NAME = 'stw_dashboard_mailing_stats_options';
 	const REST_NAMESPACE = 'stw-dashboard/v1';
-	const CACHE_VERSION = '2026-07-14-rasa-people-pagination-v1';
+	const CACHE_VERSION = '2026-07-14-advanced-ads-stats-v1';
 
 	public static function init() {
 		$instance = new self();
@@ -758,8 +758,10 @@ final class STW_Dashboard_Mailing_Stats {
 
 		if ( ! $this->table_exists( $impressions_table ) ) {
 			return array(
-				'metrics' => array(),
-				'rows'    => array(),
+				'metrics'    => array(),
+				'timeseries' => array(),
+				'breakdown'  => array(),
+				'rows'       => array(),
 			);
 		}
 
@@ -771,9 +773,6 @@ final class STW_Dashboard_Mailing_Stats {
 		$click_select = $has_clicks
 			? "(SELECT COALESCE(SUM(c.count), 0) FROM {$clicks_table} c WHERE c.ad_id = p.ID AND c.timestamp >= %d AND c.timestamp < %d)"
 			: '0';
-		$params = $has_clicks
-			? array( $start_ts, $end_ts, $start_ts, $end_ts, $page_size, $offset )
-			: array( $start_ts, $end_ts, $page_size, $offset );
 		$query = $wpdb->prepare(
 			"SELECT p.ID id, p.post_title name, p.post_status status, p.post_modified_gmt last_updated,
 				COALESCE(SUM(i.count), 0) impressions,
@@ -782,6 +781,7 @@ final class STW_Dashboard_Mailing_Stats {
 			LEFT JOIN {$impressions_table} i ON i.ad_id = p.ID AND i.timestamp >= %d AND i.timestamp < %d
 			WHERE p.post_type = %s
 			GROUP BY p.ID
+			HAVING impressions > 0 OR clicks > 0
 			ORDER BY impressions DESC
 			LIMIT %d OFFSET %d",
 			array_merge(
@@ -792,15 +792,19 @@ final class STW_Dashboard_Mailing_Stats {
 		$rows = $wpdb->get_results( $query, ARRAY_A );
 		$rows = array_map( array( $this, 'advanced_ads_row' ), is_array( $rows ) ? $rows : array() );
 		$totals = $this->advanced_ads_totals( $impressions_table, $has_clicks ? $clicks_table : '', $start_ts, $end_ts );
+		$timeseries = $this->advanced_ads_timeseries( $impressions_table, $has_clicks ? $clicks_table : '', $start, $end, $start_ts, $end_ts );
+		$breakdown = $this->advanced_ads_breakdown( $rows, (int) $totals['impressions'] );
 
 		return array(
-			'metrics' => array(
+			'metrics'    => array(
 				array( 'label' => 'Total ads', 'value' => (float) $this->advanced_ads_count(), 'previous' => null, 'change' => null, 'format' => 'number' ),
 				array( 'label' => 'Impressions', 'value' => (float) $totals['impressions'], 'previous' => null, 'change' => null, 'format' => 'number' ),
 				array( 'label' => 'Clicks', 'value' => (float) $totals['clicks'], 'previous' => null, 'change' => null, 'format' => 'number' ),
 				array( 'label' => 'CTR', 'value' => (float) $this->rate( $totals['clicks'], $totals['impressions'] ), 'previous' => null, 'change' => null, 'format' => 'percent' ),
 			),
-			'rows'    => $rows,
+			'timeseries' => $timeseries,
+			'breakdown'  => $breakdown,
+			'rows'       => $rows,
 		);
 	}
 
@@ -811,8 +815,6 @@ final class STW_Dashboard_Mailing_Stats {
 			'id'          => absint( $row['id'] ?? 0 ),
 			'name'        => sanitize_text_field( $row['name'] ?? __( 'Untitled ad', 'stw-dashboard-mailing-stats' ) ),
 			'status'      => sanitize_key( $row['status'] ?? 'unknown' ),
-			'placement'   => __( 'Advanced Ads', 'stw-dashboard-mailing-stats' ),
-			'group'       => __( 'Tracked ads', 'stw-dashboard-mailing-stats' ),
 			'impressions' => $impressions,
 			'clicks'      => $clicks,
 			'ctr'         => $this->rate( $clicks, $impressions ),
@@ -842,6 +844,67 @@ final class STW_Dashboard_Mailing_Stats {
 		return array( 'impressions' => $impressions, 'clicks' => $clicks );
 	}
 
+	private function advanced_ads_timeseries( $impressions_table, $clicks_table, $start, $end, $start_ts, $end_ts ) {
+		global $wpdb;
+		$impressions = $this->advanced_ads_daily_counts( $impressions_table, $start_ts, $end_ts );
+		$clicks = $clicks_table ? $this->advanced_ads_daily_counts( $clicks_table, $start_ts, $end_ts ) : array();
+		$points = array();
+		$current = strtotime( $start . ' 00:00:00' );
+		$last = strtotime( $end . ' 00:00:00' );
+
+		while ( $current && $last && $current <= $last ) {
+			$date = gmdate( 'Y-m-d', $current );
+			$points[] = array(
+				'date'      => $date,
+				'value'     => (float) ( $impressions[ $date ] ?? 0 ),
+				'secondary' => (float) ( $clicks[ $date ] ?? 0 ),
+			);
+			$current = strtotime( '+1 day', $current );
+		}
+
+		return $points;
+	}
+
+	private function advanced_ads_daily_counts( $table, $start_ts, $end_ts ) {
+		global $wpdb;
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT (`timestamp` - (`timestamp` %% 100)) day_key, COALESCE(SUM(`count`), 0) total
+				FROM {$table}
+				WHERE `timestamp` >= %d AND `timestamp` < %d
+				GROUP BY day_key
+				ORDER BY day_key ASC",
+				$start_ts,
+				$end_ts
+			),
+			ARRAY_A
+		);
+		$counts = array();
+		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+			$date = $this->advanced_ads_date_from_timestamp( $row['day_key'] ?? '' );
+			if ( '' !== $date ) {
+				$counts[ $date ] = absint( $row['total'] ?? 0 );
+			}
+		}
+		return $counts;
+	}
+
+	private function advanced_ads_breakdown( array $rows, $total_impressions ) {
+		$breakdown = array();
+		foreach ( array_slice( $rows, 0, 8 ) as $row ) {
+			$impressions = absint( $row['impressions'] ?? 0 );
+			if ( $impressions <= 0 ) {
+				continue;
+			}
+			$breakdown[] = array(
+				'label' => sanitize_text_field( $row['name'] ?? __( 'Untitled ad', 'stw-dashboard-mailing-stats' ) ),
+				'value' => (float) $impressions,
+				'share' => (float) $this->rate( $impressions, $total_impressions ),
+			);
+		}
+		return $breakdown;
+	}
+
 	private function advanced_ads_count() {
 		$query = new WP_Query(
 			array(
@@ -862,6 +925,17 @@ final class STW_Dashboard_Mailing_Stats {
 		$timestamp = strtotime( get_gmt_from_date( $datetime ) );
 		$local = get_date_from_gmt( gmdate( 'Y-m-d H:i:s', $timestamp ), 'ymWdH' );
 		return absint( $local );
+	}
+
+	private function advanced_ads_date_from_timestamp( $timestamp ) {
+		$value = str_pad( (string) absint( $timestamp ), 10, '0', STR_PAD_LEFT );
+		$year = absint( substr( $value, 0, 2 ) );
+		$month = absint( substr( $value, 2, 2 ) );
+		$day = absint( substr( $value, 6, 2 ) );
+		if ( $year <= 0 || $month <= 0 || $day <= 0 ) {
+			return '';
+		}
+		return sprintf( '20%02d-%02d-%02d', $year, $month, $day );
 	}
 
 	private function rate( $numerator, $denominator ) {
