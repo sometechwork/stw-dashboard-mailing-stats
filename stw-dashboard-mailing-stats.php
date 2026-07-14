@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class STW_Dashboard_Mailing_Stats {
 	const OPTION_NAME = 'stw_dashboard_mailing_stats_options';
 	const REST_NAMESPACE = 'stw-dashboard/v1';
-	const CACHE_VERSION = '2026-07-14-rasa-activity-v3';
+	const CACHE_VERSION = '2026-07-14-rasa-people-pagination-v1';
 
 	public static function init() {
 		$instance = new self();
@@ -918,33 +918,132 @@ final class STW_Dashboard_Mailing_Stats {
 	}
 
 	private function rasa_people_counts( $token ) {
-		$url = add_query_arg( array( 'limit' => 10000 ), $this->rasa_url( 'persons' ) );
-		$counts = array( 'total' => 0, 'subscribed' => 0, 'unsubscribed' => 0 );
-		$response = wp_remote_get( $url, $this->rasa_request_args( $token ) );
-		$body = $this->remote_json( $response );
-		$results = isset( $body['results'] ) && is_array( $body['results'] ) ? $body['results'] : array();
-		foreach ( $results as $item ) {
-			$person = isset( $item['data'] ) && is_array( $item['data'] ) ? $item['data'] : $item;
-			if ( ! is_array( $person ) ) {
-				continue;
-			}
-			++$counts['total'];
-			if ( $this->rasa_person_is_subscribed( $person ) ) {
-				++$counts['subscribed'];
+		$query_counts = $this->rasa_people_query_counts( $token );
+		if ( $this->rasa_people_counts_are_usable( $query_counts ) ) {
+			return $query_counts;
+		}
+
+		$counts = $this->rasa_people_counts_from_pages( $token, absint( $query_counts['total'] ?? 0 ) );
+		if ( $counts['total'] <= 0 ) {
+			return $query_counts;
+		}
+
+		if ( $query_counts['total'] > $counts['total'] ) {
+			$unknown = $query_counts['total'] - $counts['total'];
+			$counts['total'] = $query_counts['total'];
+			if ( $query_counts['subscribed'] > 0 && $query_counts['subscribed'] <= $counts['total'] ) {
+				$counts['subscribed'] = $query_counts['subscribed'];
+				$counts['unsubscribed'] = max( 0, $counts['total'] - $counts['subscribed'] );
 			} else {
-				++$counts['unsubscribed'];
+				$counts['subscribed'] += $unknown;
 			}
 		}
 
-		$metadata = isset( $body['metadata'] ) && is_array( $body['metadata'] ) ? $body['metadata'] : array();
-		$metadata_total = absint(
-			$metadata['total_query_count']
-			?? $metadata['record_count']
-			?? $metadata['total_count']
-			?? $metadata['total_records']
-			?? $metadata['total']
-			?? 0
+		return $counts;
+	}
+
+	private function rasa_people_query_counts( $token ) {
+		$total = $this->rasa_person_count( $token, array() );
+		$subscribed = $this->rasa_person_count_any(
+			$token,
+			array(
+				array( 'is_subscribed' => '1' ),
+				array( 'is_subscribed' => 'true' ),
+				array( 'is_receiving'  => '1' ),
+				array( 'is_receiving'  => 'true' ),
+				array( 'status'        => 'subscribed' ),
+				array( 'subscription_status' => 'subscribed' ),
+			)
 		);
+		$unsubscribed = $this->rasa_person_count_any(
+			$token,
+			array(
+				array( 'is_subscribed' => '0' ),
+				array( 'is_subscribed' => 'false' ),
+				array( 'is_receiving'  => '0' ),
+				array( 'is_receiving'  => 'false' ),
+				array( 'status'        => 'unsubscribed' ),
+				array( 'status'        => 'inactive' ),
+				array( 'subscription_status' => 'unsubscribed' ),
+				array( 'subscription_status' => 'inactive' ),
+			)
+		);
+
+		return array(
+			'total'        => $total,
+			'subscribed'   => $subscribed,
+			'unsubscribed' => $unsubscribed,
+		);
+	}
+
+	private function rasa_people_counts_are_usable( array $counts ) {
+		$total = absint( $counts['total'] ?? 0 );
+		$subscribed = absint( $counts['subscribed'] ?? 0 );
+		$unsubscribed = absint( $counts['unsubscribed'] ?? 0 );
+		if ( $total <= 0 || $subscribed + $unsubscribed <= 0 ) {
+			return false;
+		}
+
+		return $subscribed + $unsubscribed <= $total;
+	}
+
+	private function rasa_people_counts_from_pages( $token, $expected_total ) {
+		$counts = array( 'total' => 0, 'subscribed' => 0, 'unsubscribed' => 0 );
+		$limit = 1000;
+		$offset = 0;
+		$seen_first_signature = '';
+		$metadata_total = absint( $expected_total );
+
+		for ( $page = 0; $page < 50; ++$page ) {
+			$url = add_query_arg( array( 'limit' => $limit, 'offset' => $offset ), $this->rasa_url( 'persons' ) );
+			$response = wp_remote_get( $url, $this->rasa_request_args( $token ) );
+			$body = $this->remote_json( $response );
+			$results = isset( $body['results'] ) && is_array( $body['results'] ) ? $body['results'] : array();
+			if ( empty( $results ) ) {
+				break;
+			}
+
+			$metadata = isset( $body['metadata'] ) && is_array( $body['metadata'] ) ? $body['metadata'] : array();
+			$metadata_total = max(
+				$metadata_total,
+				absint(
+					$metadata['total_query_count']
+					?? $metadata['record_count']
+					?? $metadata['total_count']
+					?? $metadata['total_records']
+					?? $metadata['total']
+					?? 0
+				)
+			);
+
+			$first_person = isset( $results[0]['data'] ) && is_array( $results[0]['data'] ) ? $results[0]['data'] : $results[0];
+			$signature = is_array( $first_person ) ? $this->rasa_person_signature( $first_person ) : '';
+			if ( $offset > 0 && '' !== $signature && $signature === $seen_first_signature ) {
+				break;
+			}
+			if ( 0 === $offset ) {
+				$seen_first_signature = $signature;
+			}
+
+			foreach ( $results as $item ) {
+				$person = isset( $item['data'] ) && is_array( $item['data'] ) ? $item['data'] : $item;
+				if ( ! is_array( $person ) ) {
+					continue;
+				}
+				++$counts['total'];
+				if ( $this->rasa_person_is_subscribed( $person ) ) {
+					++$counts['subscribed'];
+				} else {
+					++$counts['unsubscribed'];
+				}
+			}
+
+			$offset += $limit;
+			if ( count( $results ) < $limit || ( $metadata_total > 0 && $offset >= $metadata_total ) ) {
+				break;
+			}
+		}
+
 		if ( $metadata_total > $counts['total'] ) {
 			$unknown = $metadata_total - $counts['total'];
 			$counts['total'] = $metadata_total;
@@ -954,6 +1053,15 @@ final class STW_Dashboard_Mailing_Stats {
 		}
 
 		return $counts;
+	}
+
+	private function rasa_person_signature( array $person ) {
+		foreach ( array( 'id', 'person_id', 'email', 'email_address' ) as $key ) {
+			if ( isset( $person[ $key ] ) && '' !== (string) $person[ $key ] ) {
+				return (string) $person[ $key ];
+			}
+		}
+		return md5( wp_json_encode( $person ) );
 	}
 
 	private function rasa_person_is_subscribed( array $person ) {
