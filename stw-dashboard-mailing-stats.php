@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class STW_Dashboard_Mailing_Stats {
 	const OPTION_NAME = 'stw_dashboard_mailing_stats_options';
 	const REST_NAMESPACE = 'stw-dashboard/v1';
-	const CACHE_VERSION = '2026-07-14-advanced-ads-stats-v1';
+	const CACHE_VERSION = '2026-07-15-rasa-pagination-v2';
 
 	public static function init() {
 		$instance = new self();
@@ -1057,47 +1057,51 @@ final class STW_Dashboard_Mailing_Stats {
 		if ( $total <= 0 || $subscribed + $unsubscribed <= 0 ) {
 			return false;
 		}
+		if ( 0 === $unsubscribed && 0 === $total % 1000 ) {
+			return false;
+		}
 
 		return $subscribed + $unsubscribed <= $total;
 	}
 
 	private function rasa_people_counts_from_pages( $token, $expected_total ) {
-		$counts = array( 'total' => 0, 'subscribed' => 0, 'unsubscribed' => 0 );
 		$limit = 1000;
-		$offset = 0;
+		$best_counts = array( 'total' => 0, 'subscribed' => 0, 'unsubscribed' => 0 );
+		foreach ( array( 'offset', 'page', 'page_number' ) as $strategy ) {
+			$counts = $this->rasa_people_counts_from_page_strategy( $token, $expected_total, $limit, $strategy );
+			if ( $counts['total'] > $best_counts['total'] ) {
+				$best_counts = $counts;
+			}
+			if ( $counts['total'] > $limit ) {
+				return $counts;
+			}
+		}
+		return $best_counts;
+	}
+
+	private function rasa_people_counts_from_page_strategy( $token, $expected_total, $limit, $strategy ) {
+		$counts = array( 'total' => 0, 'subscribed' => 0, 'unsubscribed' => 0 );
 		$seen_first_signature = '';
 		$metadata_total = absint( $expected_total );
 
 		for ( $page = 0; $page < 50; ++$page ) {
-			$url = add_query_arg( array( 'limit' => $limit, 'offset' => $offset ), $this->rasa_url( 'persons' ) );
-			$response = wp_remote_get( $url, $this->rasa_request_args( $token ) );
-			$body = $this->remote_json( $response );
+			$query_args = array( 'limit' => $limit );
+			if ( 'offset' === $strategy ) {
+				$query_args['offset'] = $page * $limit;
+			} elseif ( 'page' === $strategy ) {
+				$query_args['page'] = $page + 1;
+			} else {
+				$query_args['page_number'] = $page + 1;
+			}
+
+			$body = $this->remote_json( wp_remote_get( add_query_arg( $query_args, $this->rasa_url( 'persons' ) ), $this->rasa_request_args( $token ) ) );
 			$results = isset( $body['results'] ) && is_array( $body['results'] ) ? $body['results'] : array();
 			if ( empty( $results ) ) {
 				break;
 			}
 
-			$metadata = isset( $body['metadata'] ) && is_array( $body['metadata'] ) ? $body['metadata'] : array();
-			$metadata_total = max(
-				$metadata_total,
-				absint(
-					$metadata['total_query_count']
-					?? $metadata['record_count']
-					?? $metadata['total_count']
-					?? $metadata['total_records']
-					?? $metadata['total']
-					?? 0
-				)
-			);
-
-			$first_person = isset( $results[0]['data'] ) && is_array( $results[0]['data'] ) ? $results[0]['data'] : $results[0];
-			$signature = is_array( $first_person ) ? $this->rasa_person_signature( $first_person ) : '';
-			if ( $offset > 0 && '' !== $signature && $signature === $seen_first_signature ) {
-				break;
-			}
-			if ( 0 === $offset ) {
-				$seen_first_signature = $signature;
-			}
+			$page_metadata_total = $this->rasa_metadata_total( $body );
+			$metadata_total = max( $metadata_total, $page_metadata_total );
 
 			foreach ( $results as $item ) {
 				$person = isset( $item['data'] ) && is_array( $item['data'] ) ? $item['data'] : $item;
@@ -1112,8 +1116,20 @@ final class STW_Dashboard_Mailing_Stats {
 				}
 			}
 
-			$offset += $limit;
-			if ( count( $results ) < $limit || ( $metadata_total > 0 && $offset >= $metadata_total ) ) {
+			$first_person = isset( $results[0]['data'] ) && is_array( $results[0]['data'] ) ? $results[0]['data'] : $results[0];
+			$signature = is_array( $first_person ) ? $this->rasa_person_signature( $first_person ) : '';
+			if ( $page > 0 && '' !== $signature && $signature === $seen_first_signature ) {
+				$counts['total'] -= count( $results );
+				$counts = $this->rasa_recount_without_page( $counts, $results );
+				break;
+			}
+			if ( 0 === $page ) {
+				$seen_first_signature = $signature;
+			}
+
+			$next_offset = ( $page + 1 ) * $limit;
+			$trust_metadata_total = $metadata_total > $limit || 0 !== $metadata_total % $limit;
+			if ( count( $results ) < $limit || ( $trust_metadata_total && $next_offset >= $metadata_total ) ) {
 				break;
 			}
 		}
@@ -1127,6 +1143,33 @@ final class STW_Dashboard_Mailing_Stats {
 		}
 
 		return $counts;
+	}
+
+	private function rasa_recount_without_page( array $counts, array $results ) {
+		foreach ( $results as $item ) {
+			$person = isset( $item['data'] ) && is_array( $item['data'] ) ? $item['data'] : $item;
+			if ( ! is_array( $person ) ) {
+				continue;
+			}
+			if ( $this->rasa_person_is_subscribed( $person ) ) {
+				$counts['subscribed'] = max( 0, $counts['subscribed'] - 1 );
+			} else {
+				$counts['unsubscribed'] = max( 0, $counts['unsubscribed'] - 1 );
+			}
+		}
+		return $counts;
+	}
+
+	private function rasa_metadata_total( array $body ) {
+		$metadata = isset( $body['metadata'] ) && is_array( $body['metadata'] ) ? $body['metadata'] : array();
+		return absint(
+			$metadata['total_query_count']
+			?? $metadata['record_count']
+			?? $metadata['total_count']
+			?? $metadata['total_records']
+			?? $metadata['total']
+			?? 0
+		);
 	}
 
 	private function rasa_person_signature( array $person ) {
