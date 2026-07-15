@@ -16,7 +16,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class STW_Dashboard_Mailing_Stats {
 	const OPTION_NAME = 'stw_dashboard_mailing_stats_options';
 	const REST_NAMESPACE = 'stw-dashboard/v1';
-	const CACHE_VERSION = '2026-07-15-rasa-pagination-v2';
+	const CACHE_VERSION = '2026-07-15-rasa-debug-v1';
+
+	private $rasa_debug = array();
 
 	public static function init() {
 		$instance = new self();
@@ -748,6 +750,7 @@ final class STW_Dashboard_Mailing_Stats {
 					'sentAt'       => gmdate( 'c' ),
 				),
 			),
+			'debug'       => $this->rasa_debug,
 		);
 	}
 
@@ -992,8 +995,16 @@ final class STW_Dashboard_Mailing_Stats {
 	}
 
 	private function rasa_people_counts( $token ) {
+		$this->rasa_debug = array(
+			'cacheVersion' => self::CACHE_VERSION,
+			'queryCounts'  => null,
+			'strategies'   => array(),
+			'selected'     => null,
+		);
 		$query_counts = $this->rasa_people_query_counts( $token );
+		$this->rasa_debug['queryCounts'] = $query_counts;
 		if ( $this->rasa_people_counts_are_usable( $query_counts ) ) {
+			$this->rasa_debug['selected'] = array_merge( array( 'source' => 'query-counts' ), $query_counts );
 			return $query_counts;
 		}
 
@@ -1013,6 +1024,7 @@ final class STW_Dashboard_Mailing_Stats {
 			}
 		}
 
+		$this->rasa_debug['selected'] = array_merge( array( 'source' => 'pagination' ), $counts );
 		return $counts;
 	}
 
@@ -1069,6 +1081,7 @@ final class STW_Dashboard_Mailing_Stats {
 		$best_counts = array( 'total' => 0, 'subscribed' => 0, 'unsubscribed' => 0 );
 		foreach ( array( 'offset', 'page', 'page_number' ) as $strategy ) {
 			$counts = $this->rasa_people_counts_from_page_strategy( $token, $expected_total, $limit, $strategy );
+			$this->rasa_debug['strategies'][] = array_merge( array( 'strategy' => $strategy ), $counts );
 			if ( $counts['total'] > $best_counts['total'] ) {
 				$best_counts = $counts;
 			}
@@ -1083,6 +1096,8 @@ final class STW_Dashboard_Mailing_Stats {
 		$counts = array( 'total' => 0, 'subscribed' => 0, 'unsubscribed' => 0 );
 		$seen_first_signature = '';
 		$metadata_total = absint( $expected_total );
+		$pages_fetched = 0;
+		$stop_reason = 'page-limit';
 
 		for ( $page = 0; $page < 50; ++$page ) {
 			$query_args = array( 'limit' => $limit );
@@ -1097,8 +1112,10 @@ final class STW_Dashboard_Mailing_Stats {
 			$body = $this->remote_json( wp_remote_get( add_query_arg( $query_args, $this->rasa_url( 'persons' ) ), $this->rasa_request_args( $token ) ) );
 			$results = isset( $body['results'] ) && is_array( $body['results'] ) ? $body['results'] : array();
 			if ( empty( $results ) ) {
+				$stop_reason = 'empty-results';
 				break;
 			}
+			++$pages_fetched;
 
 			$page_metadata_total = $this->rasa_metadata_total( $body );
 			$metadata_total = max( $metadata_total, $page_metadata_total );
@@ -1121,6 +1138,7 @@ final class STW_Dashboard_Mailing_Stats {
 			if ( $page > 0 && '' !== $signature && $signature === $seen_first_signature ) {
 				$counts['total'] -= count( $results );
 				$counts = $this->rasa_recount_without_page( $counts, $results );
+				$stop_reason = 'duplicate-first-record';
 				break;
 			}
 			if ( 0 === $page ) {
@@ -1130,6 +1148,7 @@ final class STW_Dashboard_Mailing_Stats {
 			$next_offset = ( $page + 1 ) * $limit;
 			$trust_metadata_total = $metadata_total > $limit || 0 !== $metadata_total % $limit;
 			if ( count( $results ) < $limit || ( $trust_metadata_total && $next_offset >= $metadata_total ) ) {
+				$stop_reason = count( $results ) < $limit ? 'short-page' : 'metadata-total-reached';
 				break;
 			}
 		}
@@ -1142,7 +1161,14 @@ final class STW_Dashboard_Mailing_Stats {
 			}
 		}
 
-		return $counts;
+		return array_merge(
+			$counts,
+			array(
+				'pagesFetched'  => $pages_fetched,
+				'metadataTotal' => $metadata_total,
+				'stopReason'    => $stop_reason,
+			)
+		);
 	}
 
 	private function rasa_recount_without_page( array $counts, array $results ) {
