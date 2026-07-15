@@ -1079,7 +1079,7 @@ final class STW_Dashboard_Mailing_Stats {
 	private function rasa_people_counts_from_pages( $token, $expected_total ) {
 		$limit = 1000;
 		$best_counts = array( 'total' => 0, 'subscribed' => 0, 'unsubscribed' => 0 );
-		foreach ( array( 'offset', 'page', 'page_number' ) as $strategy ) {
+		foreach ( array( 'skip', 'offset', 'page', 'page_number' ) as $strategy ) {
 			$counts = $this->rasa_people_counts_from_page_strategy( $token, $expected_total, $limit, $strategy );
 			$this->rasa_debug['strategies'][] = array_merge( array( 'strategy' => $strategy ), $counts );
 			if ( $counts['total'] > $best_counts['total'] ) {
@@ -1101,7 +1101,9 @@ final class STW_Dashboard_Mailing_Stats {
 
 		for ( $page = 0; $page < 50; ++$page ) {
 			$query_args = array( 'limit' => $limit );
-			if ( 'offset' === $strategy ) {
+			if ( 'skip' === $strategy ) {
+				$query_args['skip'] = $page * $limit;
+			} elseif ( 'offset' === $strategy ) {
 				$query_args['offset'] = $page * $limit;
 			} elseif ( 'page' === $strategy ) {
 				$query_args['page'] = $page + 1;
