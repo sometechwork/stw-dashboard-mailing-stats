@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class STW_Dashboard_Mailing_Stats {
 	const OPTION_NAME = 'stw_dashboard_mailing_stats_options';
 	const REST_NAMESPACE = 'stw-dashboard/v1';
-	const CACHE_VERSION = '2026-07-15-editorial-v1';
+	const CACHE_VERSION = '2026-07-21-ads-mailing-v1';
 
 	private $rasa_debug = array();
 
@@ -826,11 +826,14 @@ final class STW_Dashboard_Mailing_Stats {
 	}
 
 	private function mailpoet_provider( $start, $end, $limit ) {
+		$campaigns = $this->mailpoet_campaigns( $start, $end, $limit );
+		$period = $this->mailing_period_from_campaigns( $campaigns );
 		return array(
 			'provider'    => 'MailPoet',
 			'subscribers' => $this->mailpoet_subscriber_counts(),
+			'period'      => $period,
 			'lists'       => $this->mailpoet_lists(),
-			'campaigns'   => $this->mailpoet_campaigns( $start, $end, $limit ),
+			'campaigns'   => $campaigns,
 		);
 	}
 
@@ -935,6 +938,27 @@ final class STW_Dashboard_Mailing_Stats {
 		);
 	}
 
+	private function mailing_period_from_campaigns( array $campaigns ) {
+		$period = array(
+			'emailsSent'    => 0,
+			'opens'         => 0,
+			'machineOpens'  => 0,
+			'clicks'        => 0,
+			'unsubscribes'  => 0,
+			'bounces'       => 0,
+			'campaigns'     => count( $campaigns ),
+		);
+		foreach ( $campaigns as $campaign ) {
+			$period['emailsSent'] += absint( $campaign['sent'] ?? 0 );
+			$period['opens'] += absint( $campaign['opens'] ?? 0 );
+			$period['machineOpens'] += absint( $campaign['machineOpens'] ?? 0 );
+			$period['clicks'] += absint( $campaign['clicks'] ?? 0 );
+			$period['unsubscribes'] += absint( $campaign['unsubscribes'] ?? 0 );
+			$period['bounces'] += absint( $campaign['bounces'] ?? 0 );
+		}
+		return $period;
+	}
+
 	private function rasa_provider( $start, $end ) {
 		$empty = array(
 			'provider'    => 'rasa',
@@ -992,6 +1016,15 @@ final class STW_Dashboard_Mailing_Stats {
 				'bounced'      => absint( $activity['bounces'] ?? 0 ),
 				'inactive'     => 0,
 			),
+			'period'      => array(
+				'emailsSent'    => absint( $activity['delivered'] ?? 0 ),
+				'opens'         => absint( $activity['opens'] ?? 0 ),
+				'machineOpens'  => 0,
+				'clicks'        => absint( $activity['clicks'] ?? 0 ),
+				'unsubscribes'  => absint( $activity['unsubscribes'] ?? 0 ),
+				'bounces'       => absint( $activity['bounces'] ?? 0 ),
+				'campaigns'     => 1,
+			),
 			'lists'       => array(
 				array(
 					'id'         => 'rasa-v1',
@@ -1035,8 +1068,35 @@ final class STW_Dashboard_Mailing_Stats {
 		$has_clicks = $this->table_exists( $clicks_table );
 		$start_ts = $this->advanced_ads_timestamp( $start . ' 00:00:00' );
 		$end_ts = $this->advanced_ads_timestamp( gmdate( 'Y-m-d 00:00:00', strtotime( $end . ' +1 day' ) ) );
-		$offset = ( $page - 1 ) * $page_size;
+		$rows = $this->advanced_ads_rows_query( $impressions_table, $has_clicks ? $clicks_table : '', $start_ts, $end_ts, $page_size, ( $page - 1 ) * $page_size );
+		$rows = array_map( array( $this, 'advanced_ads_row' ), is_array( $rows ) ? $rows : array() );
+		$all_rows = array_map(
+			array( $this, 'advanced_ads_row' ),
+			$this->advanced_ads_rows_query( $impressions_table, $has_clicks ? $clicks_table : '', $start_ts, $end_ts, 500, 0 )
+		);
+		$totals = $this->advanced_ads_totals( $impressions_table, $has_clicks ? $clicks_table : '', $start_ts, $end_ts );
+		$timeseries = $this->advanced_ads_timeseries( $impressions_table, $has_clicks ? $clicks_table : '', $start, $end, $start_ts, $end_ts );
+		$breakdown = $this->advanced_ads_breakdown( $rows, (int) $totals['impressions'] );
 
+		return array(
+			'metrics'    => array(
+				array( 'label' => 'Total ads', 'value' => (float) $this->advanced_ads_count(), 'previous' => null, 'change' => null, 'format' => 'number' ),
+				array( 'label' => 'Impressions', 'value' => (float) $totals['impressions'], 'previous' => null, 'change' => null, 'format' => 'number' ),
+				array( 'label' => 'Clicks', 'value' => (float) $totals['clicks'], 'previous' => null, 'change' => null, 'format' => 'number' ),
+				array( 'label' => 'CTR', 'value' => (float) $this->rate( $totals['clicks'], $totals['impressions'] ), 'previous' => null, 'change' => null, 'format' => 'percent' ),
+			),
+			'timeseries' => $timeseries,
+			'breakdown'  => $breakdown,
+			'rows'       => $rows,
+			'sections'   => array(
+				'bannerPerformance' => $this->advanced_ads_banner_performance( $all_rows, $start, $end ),
+			),
+		);
+	}
+
+	private function advanced_ads_rows_query( $impressions_table, $clicks_table, $start_ts, $end_ts, $limit, $offset ) {
+		global $wpdb;
+		$has_clicks = '' !== $clicks_table;
 		$click_select = $has_clicks
 			? "(SELECT COALESCE(SUM(c.count), 0) FROM {$clicks_table} c WHERE c.ad_id = p.ID AND c.timestamp >= %d AND c.timestamp < %d)"
 			: '0';
@@ -1053,34 +1113,22 @@ final class STW_Dashboard_Mailing_Stats {
 			LIMIT %d OFFSET %d",
 			array_merge(
 				$has_clicks ? array( $start_ts, $end_ts ) : array(),
-				array( $start_ts, $end_ts, $this->advanced_ads_post_type(), $page_size, $offset )
+				array( $start_ts, $end_ts, $this->advanced_ads_post_type(), max( 1, absint( $limit ) ), max( 0, absint( $offset ) ) )
 			)
 		);
 		$rows = $wpdb->get_results( $query, ARRAY_A );
-		$rows = array_map( array( $this, 'advanced_ads_row' ), is_array( $rows ) ? $rows : array() );
-		$totals = $this->advanced_ads_totals( $impressions_table, $has_clicks ? $clicks_table : '', $start_ts, $end_ts );
-		$timeseries = $this->advanced_ads_timeseries( $impressions_table, $has_clicks ? $clicks_table : '', $start, $end, $start_ts, $end_ts );
-		$breakdown = $this->advanced_ads_breakdown( $rows, (int) $totals['impressions'] );
-
-		return array(
-			'metrics'    => array(
-				array( 'label' => 'Total ads', 'value' => (float) $this->advanced_ads_count(), 'previous' => null, 'change' => null, 'format' => 'number' ),
-				array( 'label' => 'Impressions', 'value' => (float) $totals['impressions'], 'previous' => null, 'change' => null, 'format' => 'number' ),
-				array( 'label' => 'Clicks', 'value' => (float) $totals['clicks'], 'previous' => null, 'change' => null, 'format' => 'number' ),
-				array( 'label' => 'CTR', 'value' => (float) $this->rate( $totals['clicks'], $totals['impressions'] ), 'previous' => null, 'change' => null, 'format' => 'percent' ),
-			),
-			'timeseries' => $timeseries,
-			'breakdown'  => $breakdown,
-			'rows'       => $rows,
-		);
+		return is_array( $rows ) ? $rows : array();
 	}
 
 	private function advanced_ads_row( $row ) {
 		$impressions = absint( $row['impressions'] ?? 0 );
 		$clicks = absint( $row['clicks'] ?? 0 );
+		$id = absint( $row['id'] ?? 0 );
+		$name = sanitize_text_field( $row['name'] ?? __( 'Untitled ad', 'stw-dashboard-mailing-stats' ) );
 		return array(
-			'id'          => absint( $row['id'] ?? 0 ),
-			'name'        => sanitize_text_field( $row['name'] ?? __( 'Untitled ad', 'stw-dashboard-mailing-stats' ) ),
+			'id'          => $id,
+			'name'        => $name,
+			'bannerType'  => $this->advanced_ads_banner_type( $id, $name ),
 			'status'      => sanitize_key( $row['status'] ?? 'unknown' ),
 			'impressions' => $impressions,
 			'clicks'      => $clicks,
@@ -1172,6 +1220,95 @@ final class STW_Dashboard_Mailing_Stats {
 		return $breakdown;
 	}
 
+	private function advanced_ads_banner_performance( array $rows, $start, $end ) {
+		$order = array( 'Billboard', 'Med rect', 'Wide Skyscraper', 'Mobile Fallback', 'Newsletter' );
+		$colors = array(
+			'Billboard'        => '#f09aa0',
+			'Med rect'         => '#b9dcae',
+			'Wide Skyscraper'  => '#b9b9b9',
+			'Mobile Fallback'  => '#ffe79c',
+			'Newsletter'       => '#b7d4f4',
+		);
+		$grouped = array();
+		foreach ( $rows as $row ) {
+			$type = $row['bannerType'] ?? 'Other';
+			if ( ! isset( $grouped[ $type ] ) ) {
+				$grouped[ $type ] = array( 'impressions' => 0, 'clicks' => 0 );
+			}
+			$grouped[ $type ]['impressions'] += absint( $row['impressions'] ?? 0 );
+			$grouped[ $type ]['clicks'] += absint( $row['clicks'] ?? 0 );
+		}
+
+		$days = max( 1, (int) floor( ( strtotime( $end . ' 00:00:00' ) - strtotime( $start . ' 00:00:00' ) ) / DAY_IN_SECONDS ) + 1 );
+		$weeks = max( 1 / 7, $days / 7 );
+		$types = array_values( array_unique( array_merge( $order, array_keys( $grouped ) ) ) );
+		$rows = array();
+		foreach ( $types as $type ) {
+			$impressions = absint( $grouped[ $type ]['impressions'] ?? 0 );
+			$clicks = absint( $grouped[ $type ]['clicks'] ?? 0 );
+			if ( $impressions <= 0 && $clicks <= 0 ) {
+				continue;
+			}
+			$rows[] = array(
+				'banner'             => $type,
+				'impressions'        => $impressions,
+				'clicks'             => $clicks,
+				'impressionsPerWeek' => round( $impressions / $weeks, 1 ),
+				'clicksPerWeek'      => round( $clicks / $weeks, 1 ),
+				'ctr'                => $this->rate( $clicks, $impressions ),
+				'color'              => $colors[ $type ] ?? '#d8ddd2',
+			);
+		}
+		return $rows;
+	}
+
+	private function advanced_ads_banner_type( $ad_id, $name ) {
+		$haystack = strtolower( $name . ' ' . $this->advanced_ads_meta_text( $ad_id ) );
+		$rules = array(
+			'Newsletter'      => array( 'newsletter', 'nl ', ' nl', 'mailing' ),
+			'Mobile Fallback' => array( 'mobile fallback', 'mobile-fallback', 'fallback mobile' ),
+			'Wide Skyscraper' => array( 'wide skyscraper', 'skyscraper', 'sky scraper' ),
+			'Med rect'        => array( 'med rect', 'medium rectangle', 'medium-rectangle', 'rectangle', 'mrec' ),
+			'Billboard'       => array( 'billboard' ),
+		);
+		foreach ( $rules as $label => $needles ) {
+			foreach ( $needles as $needle ) {
+				if ( false !== strpos( $haystack, $needle ) ) {
+					return $label;
+				}
+			}
+		}
+		return __( 'Other', 'stw-dashboard-mailing-stats' );
+	}
+
+	private function advanced_ads_meta_text( $ad_id ) {
+		$meta = get_post_meta( absint( $ad_id ) );
+		if ( ! is_array( $meta ) ) {
+			return '';
+		}
+		$parts = array();
+		foreach ( $meta as $key => $values ) {
+			if ( ! preg_match( '/advads|advanced|banner|placement|size|width|height|type/i', (string) $key ) ) {
+				continue;
+			}
+			$parts[] = (string) $key;
+			foreach ( (array) $values as $value ) {
+				$parts[] = $this->advanced_ads_meta_value_text( maybe_unserialize( $value ) );
+			}
+		}
+		return implode( ' ', $parts );
+	}
+
+	private function advanced_ads_meta_value_text( $value ) {
+		if ( is_array( $value ) ) {
+			return implode( ' ', array_map( array( $this, 'advanced_ads_meta_value_text' ), $value ) );
+		}
+		if ( is_object( $value ) ) {
+			return $this->advanced_ads_meta_value_text( get_object_vars( $value ) );
+		}
+		return is_scalar( $value ) ? sanitize_text_field( (string) $value ) : '';
+	}
+
 	private function advanced_ads_count() {
 		$query = new WP_Query(
 			array(
@@ -1234,18 +1371,18 @@ final class STW_Dashboard_Mailing_Stats {
 	}
 
 	private function rasa_person_count( $token, array $query_args ) {
-		$query_args = array_merge( $query_args, array( 'limit' => 1 ) );
+		$query_args = array_merge(
+			$query_args,
+			array(
+				'limit'     => 1,
+				'page_size' => 1,
+				'pageSize'  => 1,
+				'per_page'  => 1,
+			)
+		);
 		$response = wp_remote_get( add_query_arg( $query_args, $this->rasa_url( 'persons' ) ), $this->rasa_request_args( $token ) );
 		$body = $this->remote_json( $response );
-		$metadata = isset( $body['metadata'] ) && is_array( $body['metadata'] ) ? $body['metadata'] : array();
-		return absint(
-			$metadata['total_query_count']
-			?? $metadata['record_count']
-			?? $metadata['total_count']
-			?? $metadata['total_records']
-			?? $metadata['total']
-			?? count( $body['results'] ?? array() )
-		);
+		return absint( $this->rasa_metadata_total( $body ) ?: count( $body['results'] ?? array() ) );
 	}
 
 	private function rasa_person_count_any( $token, array $queries ) {
@@ -1364,15 +1501,22 @@ final class STW_Dashboard_Mailing_Stats {
 		$stop_reason = 'page-limit';
 
 		for ( $page = 0; $page < 50; ++$page ) {
-			$query_args = array( 'limit' => $limit );
+			$query_args = array(
+				'limit'     => $limit,
+				'page_size' => $limit,
+				'pageSize'  => $limit,
+				'per_page'  => $limit,
+			);
 			if ( 'skip' === $strategy ) {
 				$query_args['skip'] = $page * $limit;
 			} elseif ( 'offset' === $strategy ) {
 				$query_args['offset'] = $page * $limit;
 			} elseif ( 'page' === $strategy ) {
 				$query_args['page'] = $page + 1;
+				$query_args['page_number'] = $page + 1;
 			} else {
 				$query_args['page_number'] = $page + 1;
+				$query_args['page'] = $page + 1;
 			}
 
 			$body = $this->remote_json( wp_remote_get( add_query_arg( $query_args, $this->rasa_url( 'persons' ) ), $this->rasa_request_args( $token ) ) );
@@ -1453,15 +1597,38 @@ final class STW_Dashboard_Mailing_Stats {
 	}
 
 	private function rasa_metadata_total( array $body ) {
-		$metadata = isset( $body['metadata'] ) && is_array( $body['metadata'] ) ? $body['metadata'] : array();
-		return absint(
-			$metadata['total_query_count']
-			?? $metadata['record_count']
-			?? $metadata['total_count']
-			?? $metadata['total_records']
-			?? $metadata['total']
-			?? 0
-		);
+		foreach ( array( 'metadata', 'meta', 'pagination', 'paging' ) as $container_key ) {
+			if ( isset( $body[ $container_key ] ) && is_array( $body[ $container_key ] ) ) {
+				$total = $this->rasa_metadata_total_value( $body[ $container_key ] );
+				if ( $total > 0 ) {
+					return $total;
+				}
+			}
+		}
+		return $this->rasa_metadata_total_value( $body );
+	}
+
+	private function rasa_metadata_total_value( array $metadata ) {
+		foreach (
+			array(
+				'total_query_count',
+				'totalQueryCount',
+				'record_count',
+				'recordCount',
+				'total_count',
+				'totalCount',
+				'total_records',
+				'totalRecords',
+				'total_results',
+				'totalResults',
+				'total',
+			) as $key
+		) {
+			if ( isset( $metadata[ $key ] ) ) {
+				return absint( $metadata[ $key ] );
+			}
+		}
+		return 0;
 	}
 
 	private function rasa_person_signature( array $person ) {
