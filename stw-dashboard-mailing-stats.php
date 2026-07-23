@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class STW_Dashboard_Mailing_Stats {
 	const OPTION_NAME = 'stw_dashboard_mailing_stats_options';
 	const REST_NAMESPACE = 'stw-dashboard/v1';
-	const CACHE_VERSION = '2026-07-21-ads-mailing-v1';
+	const CACHE_VERSION = '2026-07-23-rasa-counts-v1';
 
 	private $rasa_debug = array();
 
@@ -1528,7 +1528,9 @@ final class STW_Dashboard_Mailing_Stats {
 			++$pages_fetched;
 
 			$page_metadata_total = $this->rasa_metadata_total( $body );
-			$metadata_total = max( $metadata_total, $page_metadata_total );
+			if ( $page_metadata_total >= $counts['total'] + count( $results ) ) {
+				$metadata_total = max( $metadata_total, $page_metadata_total );
+			}
 
 			foreach ( $results as $item ) {
 				$person = isset( $item['data'] ) && is_array( $item['data'] ) ? $item['data'] : $item;
@@ -1556,7 +1558,7 @@ final class STW_Dashboard_Mailing_Stats {
 			}
 
 			$next_offset = ( $page + 1 ) * $limit;
-			$trust_metadata_total = $metadata_total > $limit || 0 !== $metadata_total % $limit;
+			$trust_metadata_total = $metadata_total > $counts['total'] && ( $metadata_total > $limit || 0 !== $metadata_total % $limit );
 			if ( count( $results ) < $limit || ( $trust_metadata_total && $next_offset >= $metadata_total ) ) {
 				$stop_reason = count( $results ) < $limit ? 'short-page' : 'metadata-total-reached';
 				break;
