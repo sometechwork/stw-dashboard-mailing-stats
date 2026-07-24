@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class STW_Dashboard_Mailing_Stats {
 	const OPTION_NAME = 'stw_dashboard_mailing_stats_options';
 	const REST_NAMESPACE = 'stw-dashboard/v1';
-	const CACHE_VERSION = '2026-07-23-rasa-counts-v1';
+	const CACHE_VERSION = '2026-07-24-subscriber-movement-v1';
 
 	private $rasa_debug = array();
 
@@ -828,11 +828,14 @@ final class STW_Dashboard_Mailing_Stats {
 	private function mailpoet_provider( $start, $end, $limit ) {
 		$campaigns = $this->mailpoet_campaigns( $start, $end, $limit );
 		$period = $this->mailing_period_from_campaigns( $campaigns );
+		$lists = $this->mailpoet_lists();
+		$movement = $this->mailpoet_subscriber_movement( $start, $end, $lists );
 		return array(
 			'provider'    => 'MailPoet',
 			'subscribers' => $this->mailpoet_subscriber_counts(),
-			'period'      => $period,
-			'lists'       => $this->mailpoet_lists(),
+			'period'      => array_merge( $period, array( 'newSubscribers' => $movement['new'], 'unsubscribedSubscribers' => $movement['unsubscribed'] ) ),
+			'movement'    => $movement,
+			'lists'       => $lists,
 			'campaigns'   => $campaigns,
 		);
 	}
@@ -938,6 +941,94 @@ final class STW_Dashboard_Mailing_Stats {
 		);
 	}
 
+	private function mailpoet_subscriber_movement( $start, $end, array $lists ) {
+		global $wpdb;
+		$subscribers_table = $wpdb->prefix . 'mailpoet_subscribers';
+		$segments_table = $wpdb->prefix . 'mailpoet_subscriber_segment';
+		if ( ! $this->table_exists( $subscribers_table ) || ! $this->table_exists( $segments_table ) ) {
+			return array( 'new' => 0, 'unsubscribed' => 0, 'lists' => array(), 'source' => 'mailpoet-unavailable' );
+		}
+
+		$new_column = $this->first_existing_column( $subscribers_table, array( 'created_at', 'createdAt' ) );
+		$unsubscribed_column = $this->first_existing_column( $subscribers_table, array( 'unsubscribed_at', 'unsubscribedAt', 'updated_at', 'updatedAt' ) );
+		if ( '' === $new_column || '' === $unsubscribed_column ) {
+			return array( 'new' => 0, 'unsubscribed' => 0, 'lists' => array(), 'source' => 'mailpoet-columns-missing' );
+		}
+
+		$start_at = $start . ' 00:00:00';
+		$end_at = $end . ' 23:59:59';
+		$list_rows = array();
+		$total_new = (int) $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT COUNT(DISTINCT s.id) FROM {$subscribers_table} s WHERE s.{$new_column} BETWEEN %s AND %s",
+				$start_at,
+				$end_at
+			)
+		);
+		$total_unsubscribed = (int) $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT COUNT(DISTINCT s.id) FROM {$subscribers_table} s WHERE s.status = %s AND s.{$unsubscribed_column} BETWEEN %s AND %s",
+				'unsubscribed',
+				$start_at,
+				$end_at
+			)
+		);
+		foreach ( $lists as $list ) {
+			$list_id = absint( $list['id'] ?? 0 );
+			if ( $list_id <= 0 ) {
+				continue;
+			}
+			$new = (int) $wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT COUNT(DISTINCT s.id)
+					FROM {$subscribers_table} s
+					INNER JOIN {$segments_table} ss ON ss.subscriber_id = s.id
+					WHERE ss.segment_id = %d AND s.{$new_column} BETWEEN %s AND %s",
+					$list_id,
+					$start_at,
+					$end_at
+				)
+			);
+			$unsubscribed = (int) $wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT COUNT(DISTINCT s.id)
+					FROM {$subscribers_table} s
+					INNER JOIN {$segments_table} ss ON ss.subscriber_id = s.id
+					WHERE ss.segment_id = %d AND s.status = %s AND s.{$unsubscribed_column} BETWEEN %s AND %s",
+					$list_id,
+					'unsubscribed',
+					$start_at,
+					$end_at
+				)
+			);
+			$list_rows[] = array(
+				'provider'     => 'MailPoet',
+				'id'           => (string) $list_id,
+				'name'         => sanitize_text_field( $list['name'] ?? __( 'MailPoet list', 'stw-dashboard-mailing-stats' ) ),
+				'listScore'    => $this->rate( absint( $list['subscribed'] ?? 0 ), max( 1, absint( $list['total'] ?? 0 ) ) ),
+				'quality'      => $this->mailing_list_quality( $this->rate( absint( $list['subscribed'] ?? 0 ), max( 1, absint( $list['total'] ?? 0 ) ) ) ),
+				'new'          => $new,
+				'unsubscribed' => $unsubscribed,
+			);
+		}
+		return array(
+			'new'          => $total_new,
+			'unsubscribed' => $total_unsubscribed,
+			'lists'        => $list_rows,
+			'source'       => 'mailpoet-tables',
+		);
+	}
+
+	private function mailing_list_quality( $score ) {
+		if ( $score >= 50 ) {
+			return __( 'Excellent', 'stw-dashboard-mailing-stats' );
+		}
+		if ( $score >= 25 ) {
+			return __( 'Good', 'stw-dashboard-mailing-stats' );
+		}
+		return __( 'Needs attention', 'stw-dashboard-mailing-stats' );
+	}
+
 	private function mailing_period_from_campaigns( array $campaigns ) {
 		$period = array(
 			'emailsSent'    => 0,
@@ -1006,6 +1097,7 @@ final class STW_Dashboard_Mailing_Stats {
 			$total = max( $total, $subscribed + $not_receiving );
 		}
 		$activity = $this->rasa_activity( $token, $start, $end );
+		$movement = $this->rasa_subscriber_movement( $token, $start, $end, $subscribed, $total );
 
 		return array(
 			'provider'    => 'rasa',
@@ -1024,7 +1116,10 @@ final class STW_Dashboard_Mailing_Stats {
 				'unsubscribes'  => absint( $activity['unsubscribes'] ?? 0 ),
 				'bounces'       => absint( $activity['bounces'] ?? 0 ),
 				'campaigns'     => 1,
+				'newSubscribers' => $movement['new'],
+				'unsubscribedSubscribers' => $movement['unsubscribed'],
 			),
+			'movement'    => $movement,
 			'lists'       => array(
 				array(
 					'id'         => 'rasa-v1',
@@ -1395,6 +1490,55 @@ final class STW_Dashboard_Mailing_Stats {
 		return 0;
 	}
 
+	private function rasa_subscriber_movement( $token, $start, $end, $subscribed, $total ) {
+		$new = $this->rasa_person_count_for_queries(
+			$token,
+			array(
+				array( 'created_after' => $start . 'T00:00:00Z', 'created_before' => $end . 'T23:59:59Z' ),
+				array( 'created_at_from' => $start . 'T00:00:00Z', 'created_at_to' => $end . 'T23:59:59Z' ),
+				array( 'created_from' => $start . 'T00:00:00Z', 'created_to' => $end . 'T23:59:59Z' ),
+				array( 'start_date' => $start . 'T00:00:00Z', 'end_date' => $end . 'T23:59:59Z' ),
+			)
+		);
+		$unsubscribed = $this->rasa_person_count_for_queries(
+			$token,
+			array(
+				array( 'is_subscribed' => 'false', 'updated_after' => $start . 'T00:00:00Z', 'updated_before' => $end . 'T23:59:59Z' ),
+				array( 'is_receiving' => 'false', 'updated_after' => $start . 'T00:00:00Z', 'updated_before' => $end . 'T23:59:59Z' ),
+				array( 'status' => 'unsubscribed', 'updated_at_from' => $start . 'T00:00:00Z', 'updated_at_to' => $end . 'T23:59:59Z' ),
+				array( 'subscription_status' => 'unsubscribed', 'updated_at_from' => $start . 'T00:00:00Z', 'updated_at_to' => $end . 'T23:59:59Z' ),
+			)
+		);
+		return array(
+			'new'          => $new['count'],
+			'unsubscribed' => $unsubscribed['count'],
+			'lists'        => array(
+				array(
+					'provider'     => 'rasa',
+					'id'           => 'rasa-v1',
+					'name'         => __( 'rasa active recipients', 'stw-dashboard-mailing-stats' ),
+					'listScore'    => $this->rate( $subscribed, max( 1, $total ) ),
+					'quality'      => $this->mailing_list_quality( $this->rate( $subscribed, max( 1, $total ) ) ),
+					'new'          => $new['count'],
+					'unsubscribed' => $unsubscribed['count'],
+				),
+			),
+			'source'       => 'rasa-persons',
+			'debug'        => array( 'new' => $new['source'], 'unsubscribed' => $unsubscribed['source'] ),
+		);
+	}
+
+	private function rasa_person_count_for_queries( $token, array $queries ) {
+		foreach ( $queries as $query_args ) {
+			$counts = $this->rasa_people_counts_from_pages( $token, 0, $query_args );
+			$count = absint( $counts['total'] ?? 0 );
+			if ( $count > 0 ) {
+				return array( 'count' => $count, 'source' => array_merge( array( 'query' => $query_args ), $counts ) );
+			}
+		}
+		return array( 'count' => 0, 'source' => array( 'query' => null, 'stopReason' => 'no-filter-count' ) );
+	}
+
 	private function rasa_people_counts( $token ) {
 		$this->rasa_debug = array(
 			'cacheVersion' => self::CACHE_VERSION,
@@ -1477,11 +1621,11 @@ final class STW_Dashboard_Mailing_Stats {
 		return $subscribed + $unsubscribed <= $total;
 	}
 
-	private function rasa_people_counts_from_pages( $token, $expected_total ) {
+	private function rasa_people_counts_from_pages( $token, $expected_total, array $base_query_args = array() ) {
 		$limit = 1000;
 		$best_counts = array( 'total' => 0, 'subscribed' => 0, 'unsubscribed' => 0 );
 		foreach ( array( 'skip', 'offset', 'page', 'page_number' ) as $strategy ) {
-			$counts = $this->rasa_people_counts_from_page_strategy( $token, $expected_total, $limit, $strategy );
+			$counts = $this->rasa_people_counts_from_page_strategy( $token, $expected_total, $limit, $strategy, $base_query_args );
 			$this->rasa_debug['strategies'][] = array_merge( array( 'strategy' => $strategy ), $counts );
 			if ( $counts['total'] > $best_counts['total'] ) {
 				$best_counts = $counts;
@@ -1493,7 +1637,7 @@ final class STW_Dashboard_Mailing_Stats {
 		return $best_counts;
 	}
 
-	private function rasa_people_counts_from_page_strategy( $token, $expected_total, $limit, $strategy ) {
+	private function rasa_people_counts_from_page_strategy( $token, $expected_total, $limit, $strategy, array $base_query_args = array() ) {
 		$counts = array( 'total' => 0, 'subscribed' => 0, 'unsubscribed' => 0 );
 		$seen_first_signature = '';
 		$metadata_total = absint( $expected_total );
@@ -1501,11 +1645,14 @@ final class STW_Dashboard_Mailing_Stats {
 		$stop_reason = 'page-limit';
 
 		for ( $page = 0; $page < 50; ++$page ) {
-			$query_args = array(
+			$query_args = array_merge(
+				$base_query_args,
+				array(
 				'limit'     => $limit,
 				'page_size' => $limit,
 				'pageSize'  => $limit,
 				'per_page'  => $limit,
+				)
 			);
 			if ( 'skip' === $strategy ) {
 				$query_args['skip'] = $page * $limit;
@@ -1734,6 +1881,17 @@ final class STW_Dashboard_Mailing_Stats {
 		global $wpdb;
 		$like = $wpdb->esc_like( $table );
 		return $table === $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $like ) );
+	}
+
+	private function first_existing_column( $table, array $columns ) {
+		global $wpdb;
+		foreach ( $columns as $column ) {
+			$found = $wpdb->get_var( $wpdb->prepare( "SHOW COLUMNS FROM {$table} LIKE %s", $column ) );
+			if ( $found === $column ) {
+				return $column;
+			}
+		}
+		return '';
 	}
 
 	private function date_arg( $value, $fallback ) {
