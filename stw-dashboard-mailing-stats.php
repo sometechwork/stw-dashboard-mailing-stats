@@ -472,6 +472,7 @@ final class STW_Dashboard_Mailing_Stats {
 	}
 
 	public function rest_mailing_stats( WP_REST_Request $request ) {
+		$started = microtime( true );
 		$start = $this->date_arg( $request->get_param( 'startDate' ), gmdate( 'Y-m-d', strtotime( '-30 days' ) ) );
 		$end   = $this->date_arg( $request->get_param( 'endDate' ), gmdate( 'Y-m-d' ) );
 		$page_size = max( 1, min( 100, absint( $request->get_param( 'pageSize' ) ) ?: 25 ) );
@@ -484,31 +485,28 @@ final class STW_Dashboard_Mailing_Stats {
 		}
 
 		$cache_key = 'stw_dashboard_mailing_' . md5( self::CACHE_VERSION . '|' . get_current_blog_id() . '|' . $start . '|' . $end . '|' . $page_size );
-		$cached = get_transient( $cache_key );
-		if ( is_array( $cached ) ) {
-			if ( $switched ) {
-				restore_current_blog();
+		$response = $this->cached_rest_payload(
+			$cache_key,
+			$started,
+			function () use ( $start, $end, $page_size ) {
+				return array(
+					'providers' => array(
+						$this->mailpoet_provider( $start, $end, $page_size ),
+						$this->rasa_provider( $start, $end ),
+					),
+				);
 			}
-			return rest_ensure_response( $cached );
-		}
-
-		$payload = array(
-			'providers' => array(
-				$this->mailpoet_provider( $start, $end, $page_size ),
-				$this->rasa_provider( $start, $end ),
-			),
 		);
-
-		set_transient( $cache_key, $payload, absint( $this->option( 'cache_ttl', 600 ) ) );
 
 		if ( $switched ) {
 			restore_current_blog();
 		}
 
-		return rest_ensure_response( $payload );
+		return $response;
 	}
 
 	public function rest_ads_stats( WP_REST_Request $request ) {
+		$started = microtime( true );
 		$start = $this->date_arg( $request->get_param( 'startDate' ), gmdate( 'Y-m-d', strtotime( '-30 days' ) ) );
 		$end   = $this->date_arg( $request->get_param( 'endDate' ), gmdate( 'Y-m-d' ) );
 		$page = max( 1, absint( $request->get_param( 'page' ) ) ?: 1 );
@@ -522,25 +520,23 @@ final class STW_Dashboard_Mailing_Stats {
 		}
 
 		$cache_key = 'stw_dashboard_ads_' . md5( self::CACHE_VERSION . '|' . get_current_blog_id() . '|' . $start . '|' . $end . '|' . $page . '|' . $page_size );
-		$cached = get_transient( $cache_key );
-		if ( is_array( $cached ) ) {
-			if ( $switched ) {
-				restore_current_blog();
+		$response = $this->cached_rest_payload(
+			$cache_key,
+			$started,
+			function () use ( $start, $end, $page, $page_size ) {
+				return $this->advanced_ads_payload( $start, $end, $page, $page_size );
 			}
-			return rest_ensure_response( $cached );
-		}
-
-		$payload = $this->advanced_ads_payload( $start, $end, $page, $page_size );
-		set_transient( $cache_key, $payload, absint( $this->option( 'cache_ttl', 600 ) ) );
+		);
 
 		if ( $switched ) {
 			restore_current_blog();
 		}
 
-		return rest_ensure_response( $payload );
+		return $response;
 	}
 
 	public function rest_editorial_posts( WP_REST_Request $request ) {
+		$started = microtime( true );
 		$start = $this->date_arg( $request->get_param( 'startDate' ), gmdate( 'Y-m-d', strtotime( '-30 days' ) ) );
 		$end   = $this->date_arg( $request->get_param( 'endDate' ), gmdate( 'Y-m-d' ) );
 		$page = max( 1, absint( $request->get_param( 'page' ) ) ?: 1 );
@@ -557,25 +553,23 @@ final class STW_Dashboard_Mailing_Stats {
 		}
 
 		$cache_key = 'stw_dashboard_editorial_' . md5( self::CACHE_VERSION . '|' . get_current_blog_id() . '|' . $start . '|' . $end . '|' . $page . '|' . $page_size . '|' . $search . '|' . $author_id . '|' . $category_id );
-		$cached = get_transient( $cache_key );
-		if ( is_array( $cached ) ) {
-			if ( $switched ) {
-				restore_current_blog();
+		$response = $this->cached_rest_payload(
+			$cache_key,
+			$started,
+			function () use ( $start, $end, $page, $page_size, $search, $author_id, $category_id ) {
+				return $this->editorial_posts_payload( $start, $end, $page, $page_size, $search, $author_id, $category_id );
 			}
-			return rest_ensure_response( $cached );
-		}
-
-		$payload = $this->editorial_posts_payload( $start, $end, $page, $page_size, $search, $author_id, $category_id );
-		set_transient( $cache_key, $payload, absint( $this->option( 'cache_ttl', 600 ) ) );
+		);
 
 		if ( $switched ) {
 			restore_current_blog();
 		}
 
-		return rest_ensure_response( $payload );
+		return $response;
 	}
 
 	public function rest_all_stats( WP_REST_Request $request ) {
+		$started = microtime( true );
 		$start = $this->date_arg( $request->get_param( 'startDate' ), gmdate( 'Y-m-d', strtotime( '-30 days' ) ) );
 		$end   = $this->date_arg( $request->get_param( 'endDate' ), gmdate( 'Y-m-d' ) );
 		$page = max( 1, absint( $request->get_param( 'page' ) ) ?: 1 );
@@ -589,31 +583,106 @@ final class STW_Dashboard_Mailing_Stats {
 		}
 
 		$cache_key = 'stw_dashboard_all_' . md5( self::CACHE_VERSION . '|' . get_current_blog_id() . '|' . $start . '|' . $end . '|' . $page . '|' . $page_size );
-		$cached = get_transient( $cache_key );
-		if ( is_array( $cached ) ) {
-			if ( $switched ) {
-				restore_current_blog();
+		$response = $this->cached_rest_payload(
+			$cache_key,
+			$started,
+			function () use ( $start, $end, $page, $page_size ) {
+				return array(
+					'mailing' => array(
+						'providers' => array(
+							$this->mailpoet_provider( $start, $end, $page_size ),
+							$this->rasa_provider( $start, $end ),
+						),
+					),
+					'ads'     => $this->advanced_ads_payload( $start, $end, $page, $page_size ),
+				);
 			}
-			return rest_ensure_response( $cached );
-		}
-
-		$payload = array(
-			'mailing' => array(
-				'providers' => array(
-					$this->mailpoet_provider( $start, $end, $page_size ),
-					$this->rasa_provider( $start, $end ),
-				),
-			),
-			'ads'     => $this->advanced_ads_payload( $start, $end, $page, $page_size ),
 		);
-
-		set_transient( $cache_key, $payload, absint( $this->option( 'cache_ttl', 600 ) ) );
 
 		if ( $switched ) {
 			restore_current_blog();
 		}
 
-		return rest_ensure_response( $payload );
+		return $response;
+	}
+
+	private function cached_rest_payload( $cache_key, $started, $builder ) {
+		$cached = get_transient( $cache_key );
+		if ( is_array( $cached ) ) {
+			return $this->cache_response( $cached, 'hit', $started );
+		}
+
+		$stale_key = $cache_key . '_stale';
+		$lock_key  = $cache_key . '_lock';
+		$stale = get_transient( $stale_key );
+
+		if ( get_transient( $lock_key ) ) {
+			if ( is_array( $stale ) ) {
+				return $this->cache_response( $stale, 'stale', $started, 5 );
+			}
+			return $this->retry_later_response( $started );
+		}
+
+		set_transient( $lock_key, 1, 45 );
+
+		try {
+			$payload = call_user_func( $builder );
+			$this->remember_rest_payload( $cache_key, $payload );
+			delete_transient( $lock_key );
+			return $this->cache_response( $payload, 'miss', $started );
+		} catch ( Throwable $error ) {
+			delete_transient( $lock_key );
+			if ( is_array( $stale ) ) {
+				return $this->cache_response( $stale, 'stale', $started, 10 );
+			}
+			return $this->source_unavailable_response( $started, $error->getMessage() );
+		}
+	}
+
+	private function remember_rest_payload( $cache_key, $payload ) {
+		$ttl = absint( $this->option( 'cache_ttl', 600 ) );
+		set_transient( $cache_key, $payload, $ttl );
+		set_transient( $cache_key . '_stale', $payload, max( 6 * HOUR_IN_SECONDS, $ttl * 12 ) );
+	}
+
+	private function cache_response( $payload, $cache_status, $started, $retry_after = 0 ) {
+		$response = rest_ensure_response( $payload );
+		$response->header( 'X-STW-Cache', $cache_status );
+		$response->header( 'X-STW-Elapsed', (string) round( microtime( true ) - $started, 3 ) );
+		if ( $retry_after > 0 ) {
+			$response->header( 'Retry-After', (string) absint( $retry_after ) );
+		}
+		return $response;
+	}
+
+	private function retry_later_response( $started ) {
+		$response = new WP_REST_Response(
+			array(
+				'code'    => 'stw_dashboard_warming',
+				'message' => __( 'Dashboard stats are being prepared. Please retry shortly.', 'stw-dashboard-mailing-stats' ),
+				'data'    => array( 'status' => 429 ),
+			),
+			429
+		);
+		$response->header( 'Retry-After', '5' );
+		$response->header( 'X-STW-Cache', 'warming' );
+		$response->header( 'X-STW-Elapsed', (string) round( microtime( true ) - $started, 3 ) );
+		return $response;
+	}
+
+	private function source_unavailable_response( $started, $message ) {
+		$response = new WP_REST_Response(
+			array(
+				'code'    => 'stw_dashboard_source_unavailable',
+				'message' => $message ? sanitize_text_field( $message ) : __( 'Dashboard source data is unavailable.', 'stw-dashboard-mailing-stats' ),
+				'data'    => array( 'status' => 503 ),
+			),
+			503
+		);
+		$response->header( 'Retry-After', '10' );
+		$response->header( 'X-STW-Cache', 'error' );
+		$response->header( 'X-STW-Elapsed', (string) round( microtime( true ) - $started, 3 ) );
+		return $response;
 	}
 
 	private function editorial_posts_payload( $start, $end, $page, $page_size, $search, $author_id, $category_id ) {
