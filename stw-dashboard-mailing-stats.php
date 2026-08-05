@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class STW_Dashboard_Mailing_Stats {
 	const OPTION_NAME = 'stw_dashboard_mailing_stats_options';
 	const REST_NAMESPACE = 'stw-dashboard/v1';
-	const CACHE_VERSION = '2026-07-24-subscriber-movement-v1';
+	const CACHE_VERSION = '2026-08-05-performance-cache-v1';
 
 	private $rasa_debug = array();
 
@@ -645,6 +645,37 @@ final class STW_Dashboard_Mailing_Stats {
 		set_transient( $cache_key . '_stale', $payload, max( 6 * HOUR_IN_SECONDS, $ttl * 12 ) );
 	}
 
+	private function cached_fragment( $cache_key, $ttl, $builder, $stale_ttl = 0 ) {
+		$cached = get_transient( $cache_key );
+		if ( false !== $cached ) {
+			return $cached;
+		}
+
+		$lock_key = $cache_key . '_lock';
+		$stale_key = $cache_key . '_stale';
+		$stale = get_transient( $stale_key );
+		if ( get_transient( $lock_key ) && false !== $stale ) {
+			return $stale;
+		}
+
+		set_transient( $lock_key, 1, 45 );
+		try {
+			$value = call_user_func( $builder );
+			delete_transient( $lock_key );
+			if ( false !== $value && null !== $value ) {
+				set_transient( $cache_key, $value, max( 1, absint( $ttl ) ) );
+				set_transient( $stale_key, $value, max( absint( $stale_ttl ), absint( $ttl ) * 12, HOUR_IN_SECONDS ) );
+			}
+			return $value;
+		} catch ( Throwable $error ) {
+			delete_transient( $lock_key );
+			if ( false !== $stale ) {
+				return $stale;
+			}
+			throw $error;
+		}
+	}
+
 	private function cache_response( $payload, $cache_status, $started, $retry_after = 0 ) {
 		$response = rest_ensure_response( $payload );
 		$response->header( 'X-STW-Cache', $cache_status );
@@ -921,39 +952,55 @@ final class STW_Dashboard_Mailing_Stats {
 	}
 
 	private function mailpoet_subscriber_counts() {
-		$api = $this->mailpoet_api();
-		if ( ! $api ) {
-			return array( 'total' => 0, 'subscribed' => 0, 'unsubscribed' => 0, 'bounced' => 0, 'inactive' => 0 );
-		}
-		return array(
-			'total'        => (int) $api->getSubscribersCount(),
-			'subscribed'   => (int) $api->getSubscribersCount( array( 'status' => 'subscribed' ) ),
-			'unsubscribed' => (int) $api->getSubscribersCount( array( 'status' => 'unsubscribed' ) ),
-			'bounced'      => (int) $api->getSubscribersCount( array( 'status' => 'bounced' ) ),
-			'inactive'     => (int) $api->getSubscribersCount( array( 'status' => 'inactive' ) ),
+		$cache_key = 'stw_dashboard_mailpoet_counts_' . md5( self::CACHE_VERSION . '|' . get_current_blog_id() );
+		return $this->cached_fragment(
+			$cache_key,
+			30 * MINUTE_IN_SECONDS,
+			function () {
+				$api = $this->mailpoet_api();
+				if ( ! $api ) {
+					return array( 'total' => 0, 'subscribed' => 0, 'unsubscribed' => 0, 'bounced' => 0, 'inactive' => 0 );
+				}
+				return array(
+					'total'        => (int) $api->getSubscribersCount(),
+					'subscribed'   => (int) $api->getSubscribersCount( array( 'status' => 'subscribed' ) ),
+					'unsubscribed' => (int) $api->getSubscribersCount( array( 'status' => 'unsubscribed' ) ),
+					'bounced'      => (int) $api->getSubscribersCount( array( 'status' => 'bounced' ) ),
+					'inactive'     => (int) $api->getSubscribersCount( array( 'status' => 'inactive' ) ),
+				);
+			},
+			6 * HOUR_IN_SECONDS
 		);
 	}
 
 	private function mailpoet_lists() {
-		$api = $this->mailpoet_api();
-		if ( ! $api ) {
-			return array();
-		}
-		$lists = array();
-		foreach ( $api->getLists() as $list ) {
-			if ( ! empty( $list['deleted_at'] ) ) {
-				continue;
-			}
-			$id = absint( $list['id'] ?? 0 );
-			$lists[] = array(
-				'id'         => (string) $id,
-				'name'       => sanitize_text_field( $list['name'] ?? '' ),
-				'subscribed' => (int) $api->getSubscribersCount( array( 'status' => 'subscribed', 'listId' => $id ) ),
-				'total'      => (int) $api->getSubscribersCount( array( 'listId' => $id ) ),
-				'updatedAt'  => $this->iso_date( $list['updated_at'] ?? '' ),
-			);
-		}
-		return $lists;
+		$cache_key = 'stw_dashboard_mailpoet_lists_' . md5( self::CACHE_VERSION . '|' . get_current_blog_id() );
+		return $this->cached_fragment(
+			$cache_key,
+			30 * MINUTE_IN_SECONDS,
+			function () {
+				$api = $this->mailpoet_api();
+				if ( ! $api ) {
+					return array();
+				}
+				$lists = array();
+				foreach ( $api->getLists() as $list ) {
+					if ( ! empty( $list['deleted_at'] ) ) {
+						continue;
+					}
+					$id = absint( $list['id'] ?? 0 );
+					$lists[] = array(
+						'id'         => (string) $id,
+						'name'       => sanitize_text_field( $list['name'] ?? '' ),
+						'subscribed' => (int) $api->getSubscribersCount( array( 'status' => 'subscribed', 'listId' => $id ) ),
+						'total'      => (int) $api->getSubscribersCount( array( 'listId' => $id ) ),
+						'updatedAt'  => $this->iso_date( $list['updated_at'] ?? '' ),
+					);
+				}
+				return $lists;
+			},
+			6 * HOUR_IN_SECONDS
+		);
 	}
 
 	private function mailpoet_campaigns( $start, $end, $limit ) {
@@ -1011,6 +1058,12 @@ final class STW_Dashboard_Mailing_Stats {
 	}
 
 	private function mailpoet_subscriber_movement( $start, $end, array $lists ) {
+		$list_ids = implode( ',', array_map( 'absint', wp_list_pluck( $lists, 'id' ) ) );
+		$cache_key = 'stw_dashboard_mailpoet_movement_' . md5( self::CACHE_VERSION . '|' . get_current_blog_id() . '|' . $start . '|' . $end . '|' . $list_ids );
+		return $this->cached_fragment(
+			$cache_key,
+			30 * MINUTE_IN_SECONDS,
+			function () use ( $start, $end, $lists ) {
 		global $wpdb;
 		$subscribers_table = $wpdb->prefix . 'mailpoet_subscribers';
 		$segments_table = $wpdb->prefix . 'mailpoet_subscriber_segment';
@@ -1085,6 +1138,9 @@ final class STW_Dashboard_Mailing_Stats {
 			'unsubscribed' => $total_unsubscribed,
 			'lists'        => $list_rows,
 			'source'       => 'mailpoet-tables',
+		);
+			},
+			6 * HOUR_IN_SECONDS
 		);
 	}
 
@@ -1518,20 +1574,28 @@ final class STW_Dashboard_Mailing_Stats {
 			return '';
 		}
 
-		$response = wp_remote_post(
-			$this->rasa_url( 'tokens' ),
-			array(
-				'timeout' => 20,
-				'headers' => array(
-					'Authorization' => 'Basic ' . base64_encode( $username . ':' . $password ),
-					'Content-Type'  => 'application/json',
-				),
-				'body'    => wp_json_encode( array( 'key' => $api_key ) ),
-			)
-		);
+		$cache_key = 'stw_dashboard_rasa_token_' . md5( self::CACHE_VERSION . '|' . get_current_blog_id() . '|' . $username . '|' . substr( $api_key, 0, 8 ) );
+		return (string) $this->cached_fragment(
+			$cache_key,
+			50 * MINUTE_IN_SECONDS,
+			function () use ( $username, $password, $api_key ) {
+				$response = wp_remote_post(
+					$this->rasa_url( 'tokens' ),
+					array(
+						'timeout' => 20,
+						'headers' => array(
+							'Authorization' => 'Basic ' . base64_encode( $username . ':' . $password ),
+							'Content-Type'  => 'application/json',
+						),
+						'body'    => wp_json_encode( array( 'key' => $api_key ) ),
+					)
+				);
 
-		$body = $this->remote_json( $response );
-		return (string) ( $body['results'][0]['token'] ?? $body['results'][0]['rasa-token'] ?? '' );
+				$body = $this->remote_json( $response );
+				return (string) ( $body['results'][0]['token'] ?? $body['results'][0]['rasa-token'] ?? '' );
+			},
+			HOUR_IN_SECONDS
+		);
 	}
 
 	private function rasa_person_count( $token, array $query_args ) {
@@ -1560,6 +1624,11 @@ final class STW_Dashboard_Mailing_Stats {
 	}
 
 	private function rasa_subscriber_movement( $token, $start, $end, $subscribed, $total ) {
+		$cache_key = 'stw_dashboard_rasa_movement_' . md5( self::CACHE_VERSION . '|' . get_current_blog_id() . '|' . $start . '|' . $end . '|' . $subscribed . '|' . $total );
+		return $this->cached_fragment(
+			$cache_key,
+			30 * MINUTE_IN_SECONDS,
+			function () use ( $token, $start, $end, $subscribed, $total ) {
 		$new = $this->rasa_person_count_for_queries(
 			$token,
 			array(
@@ -1595,6 +1664,9 @@ final class STW_Dashboard_Mailing_Stats {
 			'source'       => 'rasa-persons',
 			'debug'        => array( 'new' => $new['source'], 'unsubscribed' => $unsubscribed['source'] ),
 		);
+			},
+			6 * HOUR_IN_SECONDS
+		);
 	}
 
 	private function rasa_person_count_for_queries( $token, array $queries ) {
@@ -1609,6 +1681,11 @@ final class STW_Dashboard_Mailing_Stats {
 	}
 
 	private function rasa_people_counts( $token ) {
+		$cache_key = 'stw_dashboard_rasa_people_' . md5( self::CACHE_VERSION . '|' . get_current_blog_id() . '|' . $this->rasa_username() );
+		return $this->cached_fragment(
+			$cache_key,
+			30 * MINUTE_IN_SECONDS,
+			function () use ( $token ) {
 		$this->rasa_debug = array(
 			'cacheVersion' => self::CACHE_VERSION,
 			'queryCounts'  => null,
@@ -1640,6 +1717,9 @@ final class STW_Dashboard_Mailing_Stats {
 
 		$this->rasa_debug['selected'] = array_merge( array( 'source' => 'pagination' ), $counts );
 		return $counts;
+			},
+			6 * HOUR_IN_SECONDS
+		);
 	}
 
 	private function rasa_people_query_counts( $token ) {
@@ -1868,42 +1948,50 @@ final class STW_Dashboard_Mailing_Stats {
 	}
 
 	private function rasa_activity( $token, $start, $end ) {
-		$response = wp_remote_post(
-			$this->rasa_url( 'analytics/activities' ),
-			array_merge(
-				$this->rasa_request_args( $token ),
-				array(
-					'headers' => array_merge(
-						$this->rasa_request_args( $token )['headers'],
-						array( 'Content-Type' => 'application/json' )
-					),
-					'body'    => wp_json_encode(
+		$cache_key = 'stw_dashboard_rasa_activity_' . md5( self::CACHE_VERSION . '|' . get_current_blog_id() . '|' . $start . '|' . $end );
+		return $this->cached_fragment(
+			$cache_key,
+			15 * MINUTE_IN_SECONDS,
+			function () use ( $token, $start, $end ) {
+				$response = wp_remote_post(
+					$this->rasa_url( 'analytics/activities' ),
+					array_merge(
+						$this->rasa_request_args( $token ),
 						array(
-							'date_range'    => array(
-								'start_date' => $start . 'T00:00:00Z',
-								'end_date'   => $end . 'T23:59:59Z',
+							'headers' => array_merge(
+								$this->rasa_request_args( $token )['headers'],
+								array( 'Content-Type' => 'application/json' )
 							),
-							'interval'      => 'day',
-							'metrics'       => array( 'open', 'click', 'delivered', 'bounce', 'unsubscribe' ),
-							'suspect_click' => 'real_clicks',
-							'segment_code'  => 'All',
-							'timezone'      => 'UTC',
-							'limit'         => 10000,
+							'body'    => wp_json_encode(
+								array(
+									'date_range'    => array(
+										'start_date' => $start . 'T00:00:00Z',
+										'end_date'   => $end . 'T23:59:59Z',
+									),
+									'interval'      => 'day',
+									'metrics'       => array( 'open', 'click', 'delivered', 'bounce', 'unsubscribe' ),
+									'suspect_click' => 'real_clicks',
+									'segment_code'  => 'All',
+									'timezone'      => 'UTC',
+									'limit'         => 10000,
+								)
+							),
 						)
-					),
-				)
-			)
+					)
+				);
+				$body = $this->remote_json( $response );
+				$totals = array( 'opens' => 0, 'clicks' => 0, 'delivered' => 0, 'bounces' => 0, 'unsubscribes' => 0 );
+				foreach ( $body['results'] ?? array() as $row ) {
+					$totals['opens'] += $this->rasa_metric_value( $row, array( 'total_opens', 'opens', 'open', 'unique_opens', 'unique_open' ) );
+					$totals['clicks'] += $this->rasa_metric_value( $row, array( 'total_clicks', 'clicks', 'click', 'unique_clicks', 'unique_click' ) );
+					$totals['delivered'] += $this->rasa_metric_value( $row, array( 'total_delivered', 'delivered', 'deliveries', 'delivery' ) );
+					$totals['bounces'] += $this->rasa_metric_value( $row, array( 'total_bounces', 'bounces', 'bounce', 'total_bounce' ) );
+					$totals['unsubscribes'] += $this->rasa_metric_value( $row, array( 'total_unsubscribes', 'unsubscribes', 'unsubscribe', 'unsubscribed' ) );
+				}
+				return $totals;
+			},
+			6 * HOUR_IN_SECONDS
 		);
-		$body = $this->remote_json( $response );
-		$totals = array( 'opens' => 0, 'clicks' => 0, 'delivered' => 0, 'bounces' => 0, 'unsubscribes' => 0 );
-		foreach ( $body['results'] ?? array() as $row ) {
-			$totals['opens'] += $this->rasa_metric_value( $row, array( 'total_opens', 'opens', 'open', 'unique_opens', 'unique_open' ) );
-			$totals['clicks'] += $this->rasa_metric_value( $row, array( 'total_clicks', 'clicks', 'click', 'unique_clicks', 'unique_click' ) );
-			$totals['delivered'] += $this->rasa_metric_value( $row, array( 'total_delivered', 'delivered', 'deliveries', 'delivery' ) );
-			$totals['bounces'] += $this->rasa_metric_value( $row, array( 'total_bounces', 'bounces', 'bounce', 'total_bounce' ) );
-			$totals['unsubscribes'] += $this->rasa_metric_value( $row, array( 'total_unsubscribes', 'unsubscribes', 'unsubscribe', 'unsubscribed' ) );
-		}
-		return $totals;
 	}
 
 	private function rasa_metric_value( array $row, array $keys ) {
