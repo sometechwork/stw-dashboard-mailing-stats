@@ -122,7 +122,7 @@ trait STW_Dashboard_Mailing_Stats_Rasa {
 				$response = wp_remote_post(
 					$this->rasa_url( 'tokens' ),
 					array(
-						'timeout' => 20,
+						'timeout' => 10,
 						'headers' => array(
 							'Authorization' => 'Basic ' . base64_encode( $username . ':' . $password ),
 							'Content-Type'  => 'application/json',
@@ -554,7 +554,7 @@ trait STW_Dashboard_Mailing_Stats_Rasa {
 
 	private function rasa_request_args( $token ) {
 		return array(
-			'timeout' => 20,
+			'timeout' => 8,
 			'headers' => array(
 				'Authorization' => 'Basic ' . base64_encode( $this->rasa_username() . ':' . $this->rasa_password() ),
 				'rasa-token'    => $token,

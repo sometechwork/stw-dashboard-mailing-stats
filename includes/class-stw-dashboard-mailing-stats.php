@@ -20,7 +20,7 @@ final class STW_Dashboard_Mailing_Stats {
 
 	const OPTION_NAME    = 'stw_dashboard_mailing_stats_options';
 	const REST_NAMESPACE = 'stw-dashboard/v1';
-	const CACHE_VERSION  = '2026-08-05-performance-cache-v1';
+	const CACHE_VERSION  = '2026-08-09-mailing-performance-v1';
 
 	/**
 	 * Debug context collected while reading rasa.io API data.

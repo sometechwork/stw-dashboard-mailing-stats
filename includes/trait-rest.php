@@ -138,8 +138,12 @@ trait STW_Dashboard_Mailing_Stats_REST {
 			function () use ( $start, $end, $page_size ) {
 				return array(
 					'providers' => array(
-						$this->mailpoet_provider( $start, $end, $page_size ),
-						$this->rasa_provider( $start, $end ),
+						$this->timed_mailing_provider( 'MailPoet', function () use ( $start, $end, $page_size ) {
+							return $this->mailpoet_provider( $start, $end, $page_size );
+						} ),
+						$this->timed_mailing_provider( 'rasa', function () use ( $start, $end ) {
+							return $this->rasa_provider( $start, $end );
+						} ),
 					),
 				);
 			}
@@ -237,8 +241,12 @@ trait STW_Dashboard_Mailing_Stats_REST {
 				return array(
 					'mailing' => array(
 						'providers' => array(
-							$this->mailpoet_provider( $start, $end, $page_size ),
-							$this->rasa_provider( $start, $end ),
+							$this->timed_mailing_provider( 'MailPoet', function () use ( $start, $end, $page_size ) {
+								return $this->mailpoet_provider( $start, $end, $page_size );
+							} ),
+							$this->timed_mailing_provider( 'rasa', function () use ( $start, $end ) {
+								return $this->rasa_provider( $start, $end );
+							} ),
 						),
 					),
 					'ads'     => $this->advanced_ads_payload( $start, $end, $page, $page_size ),
@@ -251,6 +259,65 @@ trait STW_Dashboard_Mailing_Stats_REST {
 		}
 
 		return $response;
+	}
+
+	private function timed_mailing_provider( $provider, $builder ) {
+		$started = microtime( true );
+		try {
+			$payload = call_user_func( $builder );
+			if ( ! is_array( $payload ) ) {
+				$payload = $this->mailing_provider_unavailable( $provider, __( 'Provider returned an invalid payload.', 'stw-dashboard-mailing-stats' ) );
+			}
+			$payload['meta'] = array_merge(
+				is_array( $payload['meta'] ?? null ) ? $payload['meta'] : array(),
+				array(
+					'elapsedSeconds' => round( microtime( true ) - $started, 3 ),
+					'status'         => empty( $payload['unavailable'] ) ? 'ready' : 'unavailable',
+				)
+			);
+			return $payload;
+		} catch ( Throwable $error ) {
+			$payload = $this->mailing_provider_unavailable( $provider, $error->getMessage() );
+			$payload['meta']['elapsedSeconds'] = round( microtime( true ) - $started, 3 );
+			return $payload;
+		}
+	}
+
+	private function mailing_provider_unavailable( $provider, $message ) {
+		return array(
+			'provider'    => sanitize_text_field( $provider ),
+			'unavailable' => true,
+			'error'       => sanitize_text_field( $message ),
+			'subscribers' => array(
+				'total'        => 0,
+				'subscribed'   => 0,
+				'unsubscribed' => 0,
+				'bounced'      => 0,
+				'inactive'     => 0,
+			),
+			'period'      => array(
+				'emailsSent'              => 0,
+				'opens'                   => 0,
+				'machineOpens'            => 0,
+				'clicks'                  => 0,
+				'unsubscribes'            => 0,
+				'bounces'                 => 0,
+				'campaigns'               => 0,
+				'newSubscribers'          => 0,
+				'unsubscribedSubscribers' => 0,
+			),
+			'movement'    => array(
+				'new'          => 0,
+				'unsubscribed' => 0,
+				'lists'        => array(),
+			),
+			'campaigns'   => array(),
+			'lists'       => array(),
+			'meta'        => array(
+				'status'  => 'unavailable',
+				'message' => sanitize_text_field( $message ),
+			),
+		);
 	}
 
 	private function cached_rest_payload( $cache_key, $started, $builder ) {
